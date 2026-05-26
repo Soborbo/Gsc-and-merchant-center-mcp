@@ -1,0 +1,13 @@
+name = "seo-mcp"
+main = "src/index.ts"
+compatibility_date = "2026-05-26"
+compatibility_flags = ["nodejs_compat"]
+
+[[kv_namespaces]]
+binding = "TOKEN_CACHE"
+id = "7f95ecc8dc68425090bc83b9462fda8b"
+
+[vars]
+# secrets set via `wrangler secret put`:
+# SERVICE_ACCOUNT_JSON  — Google service account full JSON
+# CONNECTOR_TOKEN       — 32-64 char hex string, part of the URL path
