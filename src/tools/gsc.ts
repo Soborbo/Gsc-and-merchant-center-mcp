@@ -4,6 +4,10 @@ import { getAccessToken } from "../auth";
 import type { Env } from "../types";
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const MAX_ERROR_BODY = 500;
+// GSC search analytics data is typically not fully populated for the last
+// 2-3 days. Shift the window end back by this many days for freshness.
+const GSC_FRESHNESS_LAG_DAYS = 3;
 
 function jsonContent(value: unknown) {
   return {
@@ -19,7 +23,9 @@ function errorContent(err: unknown) {
   };
 }
 
-function wrap<T>(handler: (args: T) => Promise<ReturnType<typeof jsonContent>>) {
+function wrap<T>(
+  handler: (args: T) => Promise<ReturnType<typeof jsonContent>>,
+) {
   return async (args: T) => {
     try {
       return await handler(args);
@@ -27,6 +33,24 @@ function wrap<T>(handler: (args: T) => Promise<ReturnType<typeof jsonContent>>) 
       return errorContent(err);
     }
   };
+}
+
+function extractErrorMessage(body: unknown): string | null {
+  if (
+    body &&
+    typeof body === "object" &&
+    "error" in body &&
+    typeof (body as { error: unknown }).error === "object" &&
+    (body as { error: { message?: unknown } }).error !== null
+  ) {
+    const m = (body as { error: { message?: unknown } }).error.message;
+    if (typeof m === "string") return m;
+  }
+  return null;
+}
+
+function clip(text: string): string {
+  return text.length > MAX_ERROR_BODY ? text.slice(0, MAX_ERROR_BODY) : text;
 }
 
 async function gscFetch(
@@ -50,16 +74,13 @@ async function gscFetch(
     parsed = text;
   }
   if (!res.ok) {
-    throw new Error(
-      `GSC API ${res.status} ${res.statusText}: ${
-        typeof parsed === "string" ? parsed : JSON.stringify(parsed)
-      }`,
-    );
+    const clean =
+      extractErrorMessage(parsed) ??
+      clip(typeof parsed === "string" ? parsed : JSON.stringify(parsed));
+    throw new Error(`GSC API ${res.status} ${res.statusText}: ${clean}`);
   }
   return parsed;
 }
-
-const listSitesInput = {} as const;
 
 const searchAnalyticsInput = {
   siteUrl: z
@@ -103,7 +124,9 @@ const quickWinsInput = {
     .min(0)
     .max(100)
     .optional()
-    .describe("Max CTR % (default 5 = 5%)."),
+    .describe(
+      "Max CTR threshold in percent (default 5 = 5%). Values <= 1 are interpreted as fractions and converted automatically.",
+    ),
   rowLimit: z.number().int().min(1).max(5000).optional().describe("Default 50."),
 };
 
@@ -132,7 +155,6 @@ export function registerGscTools(server: McpServer, env: Env): void {
       title: "List GSC properties",
       description:
         "List all Search Console properties this connector has access to.",
-      inputSchema: listSitesInput,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     wrap(async () => {
@@ -181,7 +203,7 @@ export function registerGscTools(server: McpServer, env: Env): void {
     {
       title: "Find SEO quick wins",
       description:
-        "Find pages and queries with high impressions but suboptimal position (typically 4-20) — opportunities where small ranking improvements drive significant traffic gains.",
+        "Find pages and queries with high impressions but suboptimal position (typically 4-20) — opportunities where small ranking improvements drive significant traffic gains. The query window ends ~3 days before today to account for GSC data freshness lag and is inclusive on both endpoints.",
       inputSchema: quickWinsInput,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
@@ -190,12 +212,14 @@ export function registerGscTools(server: McpServer, env: Env): void {
       const minImpressions = args.minImpressions ?? 100;
       const minPos = args.minPositionRange ?? 4;
       const maxPos = args.maxPositionRange ?? 20;
-      const maxCtrPct = args.maxCtr ?? 5;
+      const maxCtrRaw = args.maxCtr ?? 5;
+      const maxCtrPct = maxCtrRaw <= 1 ? maxCtrRaw * 100 : maxCtrRaw;
       const rowLimit = args.rowLimit ?? 50;
 
       const end = new Date();
+      end.setUTCDate(end.getUTCDate() - GSC_FRESHNESS_LAG_DAYS);
       const start = new Date(end);
-      start.setUTCDate(end.getUTCDate() - days);
+      start.setUTCDate(end.getUTCDate() - (days - 1));
       const fmt = (d: Date) => d.toISOString().slice(0, 10);
 
       const url = `https://searchconsole.googleapis.com/webmasters/v3/sites/${encodeURIComponent(

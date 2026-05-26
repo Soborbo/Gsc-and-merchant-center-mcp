@@ -4,6 +4,18 @@ import { getAccessToken } from "../auth";
 import type { Env } from "../types";
 
 const BASE = "https://shoppingcontent.googleapis.com/content/v2.1";
+const MAX_ERROR_BODY = 500;
+
+const DESTINATIONS = [
+  "Shopping",
+  "ShoppingAds",
+  "DisplayAds",
+  "LocalInventoryAds",
+  "FreeListings",
+  "FreeLocalListings",
+  "SurfacesAcrossGoogle",
+  "YoutubeShopping",
+] as const;
 
 function jsonContent(value: unknown) {
   return {
@@ -19,7 +31,9 @@ function errorContent(err: unknown) {
   };
 }
 
-function wrap<T>(handler: (args: T) => Promise<ReturnType<typeof jsonContent>>) {
+function wrap<T>(
+  handler: (args: T) => Promise<ReturnType<typeof jsonContent>>,
+) {
   return async (args: T) => {
     try {
       return await handler(args);
@@ -27,6 +41,30 @@ function wrap<T>(handler: (args: T) => Promise<ReturnType<typeof jsonContent>>) 
       return errorContent(err);
     }
   };
+}
+
+function extractErrorMessage(body: unknown): string | null {
+  if (
+    body &&
+    typeof body === "object" &&
+    "error" in body &&
+    typeof (body as { error: unknown }).error === "object" &&
+    (body as { error: { message?: unknown } }).error !== null
+  ) {
+    const m = (body as { error: { message?: unknown } }).error.message;
+    if (typeof m === "string") return m;
+  }
+  return null;
+}
+
+function clip(text: string): string {
+  return text.length > MAX_ERROR_BODY ? text.slice(0, MAX_ERROR_BODY) : text;
+}
+
+// Encode a path segment while preserving colons so productId values like
+// "online:en:US:sku123" reach the API in canonical form.
+function encodePath(s: string): string {
+  return encodeURIComponent(s).replace(/%3A/g, ":");
 }
 
 async function mcFetch(env: Env, url: string): Promise<unknown> {
@@ -42,16 +80,15 @@ async function mcFetch(env: Env, url: string): Promise<unknown> {
     parsed = text;
   }
   if (!res.ok) {
+    const clean =
+      extractErrorMessage(parsed) ??
+      clip(typeof parsed === "string" ? parsed : JSON.stringify(parsed));
     throw new Error(
-      `Merchant Center API ${res.status} ${res.statusText}: ${
-        typeof parsed === "string" ? parsed : JSON.stringify(parsed)
-      }`,
+      `Merchant Center API ${res.status} ${res.statusText}: ${clean}`,
     );
   }
   return parsed;
 }
-
-const listAccountsInput = {} as const;
 
 const listProductsInput = {
   merchantId: z.string(),
@@ -64,12 +101,29 @@ const productIssuesInput = {
   maxResults: z.number().int().min(1).max(250).optional().describe("Default 100."),
   pageToken: z.string().optional(),
   destinations: z
-    .array(z.enum(["Shopping", "Free listings", "Shopping ads"]))
-    .optional(),
+    .array(z.enum(DESTINATIONS))
+    .optional()
+    .describe(
+      "Content API destination enum values (PascalCase, no spaces): Shopping, ShoppingAds, FreeListings, DisplayAds, etc.",
+    ),
+  includePending: z
+    .boolean()
+    .optional()
+    .describe(
+      "If true, also surface 'pending' (in-review) products. Default false — only disapproved + warning-state items are returned.",
+    ),
 };
 
 const accountIssuesInput = {
-  merchantId: z.string(),
+  merchantId: z
+    .string()
+    .describe("Owning Merchant Center account ID (the MCA ID for sub-accounts)."),
+  accountId: z
+    .string()
+    .optional()
+    .describe(
+      "Optional sub-account ID under an MCA. Defaults to merchantId for non-MCA self-checks.",
+    ),
 };
 
 const getProductInput = {
@@ -83,13 +137,41 @@ export function registerMerchantTools(server: McpServer, env: Env): void {
     {
       title: "List Merchant Center accounts",
       description:
-        "List all Merchant Center accounts this connector has access to, including sub-accounts if it's a multi-client account (MCA).",
-      inputSchema: listAccountsInput,
+        "List all Merchant Center accounts this connector has access to, including sub-accounts if it's a multi-client account (MCA). Returns full account details (id, name, websiteUrl, adultContent, sellerId) when accessible.",
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     wrap(async () => {
-      const data = await mcFetch(env, `${BASE}/accounts/authinfo`);
-      return jsonContent(data);
+      const authinfo = (await mcFetch(
+        env,
+        `${BASE}/accounts/authinfo`,
+      )) as {
+        accountIdentifiers?: Array<{
+          merchantId?: string;
+          aggregatorId?: string;
+        }>;
+      };
+      const ids = authinfo.accountIdentifiers ?? [];
+
+      const results = await Promise.allSettled(
+        ids.map(async (id) => {
+          const owner = id.aggregatorId ?? id.merchantId;
+          const target = id.merchantId ?? id.aggregatorId;
+          if (!owner || !target) {
+            return { identifier: id, error: "missing identifier" };
+          }
+          const url = `${BASE}/${encodeURIComponent(owner)}/accounts/${encodeURIComponent(target)}`;
+          const account = await mcFetch(env, url);
+          return account;
+        }),
+      );
+
+      const accounts = results.map((r, i) =>
+        r.status === "fulfilled"
+          ? r.value
+          : { identifier: ids[i], error: (r.reason as Error).message },
+      );
+
+      return jsonContent({ identifiers: ids, accounts });
     }),
   );
 
@@ -117,7 +199,7 @@ export function registerMerchantTools(server: McpServer, env: Env): void {
     {
       title: "Get Merchant Center product issues",
       description:
-        "Get disapproved or warning-state products for a Merchant Center account. Returns products that are either fully disapproved or have item-level issues affecting visibility in Shopping ads and free listings.",
+        "Get disapproved or warning-state products for a Merchant Center account. Returns products that are either disapproved on at least one destination or have item-level issues affecting visibility in Shopping ads and free listings. 'pending' (in-review) products are excluded by default; pass includePending=true to surface them.",
       inputSchema: productIssuesInput,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
@@ -144,13 +226,15 @@ export function registerMerchantTools(server: McpServer, env: Env): void {
       };
 
       const all = data.resources ?? [];
+      const includePending = args.includePending === true;
       const filtered = all.filter((p) => {
         const hasIssues = (p.itemLevelIssues?.length ?? 0) > 0;
-        const notApproved =
-          p.destinationStatuses?.some(
-            (d) => d.status && d.status !== "approved",
-          ) ?? false;
-        return hasIssues || notApproved;
+        const hasDisapproved =
+          p.destinationStatuses?.some((d) => d.status === "disapproved") ??
+          false;
+        const hasPending =
+          p.destinationStatuses?.some((d) => d.status === "pending") ?? false;
+        return hasIssues || hasDisapproved || (includePending && hasPending);
       });
 
       return jsonContent({
@@ -168,13 +252,14 @@ export function registerMerchantTools(server: McpServer, env: Env): void {
     {
       title: "Get Merchant Center account issues",
       description:
-        "Get account-level issues, suspensions, and warnings for a Merchant Center account. Critical for catching account-wide problems that block all products.",
+        "Get account-level issues, suspensions, and warnings for a Merchant Center account. Critical for catching account-wide problems that block all products. For MCA setups, pass accountId to inspect a specific sub-account.",
       inputSchema: accountIssuesInput,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     wrap(async (args) => {
-      const mid = encodeURIComponent(args.merchantId);
-      const url = `${BASE}/${mid}/accountstatuses/${mid}`;
+      const owner = encodeURIComponent(args.merchantId);
+      const target = encodeURIComponent(args.accountId ?? args.merchantId);
+      const url = `${BASE}/${owner}/accountstatuses/${target}`;
       const data = await mcFetch(env, url);
       return jsonContent(data);
     }),
@@ -185,18 +270,34 @@ export function registerMerchantTools(server: McpServer, env: Env): void {
     {
       title: "Get Merchant Center product",
       description:
-        "Get full details and current status for a single product including all attribute values and issue history.",
+        "Get full details and current status for a single product including all attribute values and issue history. Either fetch may fail independently (e.g. productstatuses 404 on uncrawled items) — partial results are returned.",
       inputSchema: getProductInput,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     wrap(async (args) => {
       const mid = encodeURIComponent(args.merchantId);
-      const pid = encodeURIComponent(args.productId);
-      const [product, status] = await Promise.all([
+      const pid = encodePath(args.productId);
+      const [productRes, statusRes] = await Promise.allSettled([
         mcFetch(env, `${BASE}/${mid}/products/${pid}`),
         mcFetch(env, `${BASE}/${mid}/productstatuses/${pid}`),
       ]);
-      return jsonContent({ product, status });
+      if (productRes.status === "rejected" && statusRes.status === "rejected") {
+        throw new Error(
+          `Both product and productstatuses fetches failed. product: ${
+            (productRes.reason as Error).message
+          } | status: ${(statusRes.reason as Error).message}`,
+        );
+      }
+      return jsonContent({
+        product:
+          productRes.status === "fulfilled"
+            ? productRes.value
+            : { error: (productRes.reason as Error).message },
+        status:
+          statusRes.status === "fulfilled"
+            ? statusRes.value
+            : { error: (statusRes.reason as Error).message },
+      });
     }),
   );
 }
