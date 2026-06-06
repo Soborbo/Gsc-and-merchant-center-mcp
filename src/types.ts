@@ -1,6 +1,6 @@
 export interface Env {
   TOKEN_CACHE: KVNamespace;
-  SERVICE_ACCOUNT_JSON: string;
+  GA_SERVICE_ACCOUNT_JSON: string;
   CONNECTOR_TOKEN: string;
 }
 

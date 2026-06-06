@@ -7,8 +7,8 @@ const FRESHNESS_SKEW_SECONDS = 300;
 const TTL_SAFETY_SECONDS = 600;
 
 export async function getAccessToken(env: Env): Promise<string> {
-  if (!env.SERVICE_ACCOUNT_JSON) {
-    throw new Error("SERVICE_ACCOUNT_JSON env var is not set");
+  if (!env.GA_SERVICE_ACCOUNT_JSON) {
+    throw new Error("GA_SERVICE_ACCOUNT_JSON env var is not set");
   }
 
   const cached = (await env.TOKEN_CACHE.get(TOKEN_CACHE_KEY, "json").catch(
@@ -23,7 +23,7 @@ export async function getAccessToken(env: Env): Promise<string> {
     return cached.access_token;
   }
 
-  const sa = parseServiceAccount(env.SERVICE_ACCOUNT_JSON);
+  const sa = parseServiceAccount(env.GA_SERVICE_ACCOUNT_JSON);
   const now = nowSeconds();
   const tokenUri = sa.token_uri || "https://oauth2.googleapis.com/token";
 
