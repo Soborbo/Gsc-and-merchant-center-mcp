@@ -225,26 +225,38 @@ export function registerGscTools(server: McpServer, env: Env): void {
       const url = `https://searchconsole.googleapis.com/webmasters/v3/sites/${encodeURIComponent(
         args.siteUrl,
       )}/searchAnalytics/query`;
-      const data = (await gscFetch(env, url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          startDate: fmt(start),
-          endDate: fmt(end),
-          dimensions: ["query", "page"],
-          rowLimit: 5000,
-        }),
-      })) as {
-        rows?: Array<{
-          keys: string[];
-          clicks: number;
-          impressions: number;
-          ctr: number;
-          position: number;
-        }>;
+      type AnalyticsRow = {
+        keys: string[];
+        clicks: number;
+        impressions: number;
+        ctr: number;
+        position: number;
       };
-
-      const rows = data.rows ?? [];
+      // Search Analytics has no "order by impressions" and a single page is
+      // capped at 25000 rows ordered by clicks desc — so low-click but
+      // high-impression rows (exactly the quick-win targets) can fall off the
+      // end on large sites. Page through the full result set up to a safety cap.
+      const PAGE_SIZE = 25000;
+      const MAX_PAGES = 4;
+      const rows: AnalyticsRow[] = [];
+      let scanCapped = false;
+      for (let page = 0; page < MAX_PAGES; page++) {
+        const data = (await gscFetch(env, url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            startDate: fmt(start),
+            endDate: fmt(end),
+            dimensions: ["query", "page"],
+            rowLimit: PAGE_SIZE,
+            startRow: page * PAGE_SIZE,
+          }),
+        })) as { rows?: AnalyticsRow[] };
+        const batch = data.rows ?? [];
+        rows.push(...batch);
+        if (batch.length < PAGE_SIZE) break;
+        if (page === MAX_PAGES - 1) scanCapped = true;
+      }
       const filtered = rows
         .filter(
           (r) =>
@@ -276,6 +288,7 @@ export function registerGscTools(server: McpServer, env: Env): void {
           maxCtrPct,
         },
         totalRowsScanned: rows.length,
+        scanCapped,
         rows: filtered,
       });
     }),

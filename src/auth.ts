@@ -1,14 +1,29 @@
-import type { CachedToken, Env, ServiceAccount } from "./types";
+import type { CachedToken, Env } from "./types";
 
-const SCOPE =
-  "https://www.googleapis.com/auth/webmasters https://www.googleapis.com/auth/content";
 const TOKEN_CACHE_KEY = "google:access_token";
+const REFRESH_TOKEN_KEY = "google:refresh_token";
 const FRESHNESS_SKEW_SECONDS = 300;
 const TTL_SAFETY_SECONDS = 600;
+const TOKEN_URI = "https://oauth2.googleapis.com/token";
+
+// The connector authenticates as a Google user (OAuth), not a service account,
+// so it inherits that user's existing access to every Search Console property
+// and Merchant Center account — no per-property sharing required.
+export const OAUTH_SCOPES = [
+  "https://www.googleapis.com/auth/webmasters.readonly",
+  "https://www.googleapis.com/auth/content",
+];
+
+// Returns a valid Google access token, refreshing via the stored refresh token
+// when the cached access token is missing or about to expire.
+// In-isolate single-flight: concurrent cache-miss callers in the same isolate
+// share one token exchange instead of each hitting Google. Single-tenant, so
+// the env captured by the first caller is equivalent for the rest.
+let inFlightRefresh: Promise<string> | null = null;
 
 export async function getAccessToken(env: Env): Promise<string> {
-  if (!env.GA_SERVICE_ACCOUNT_JSON) {
-    throw new Error("GA_SERVICE_ACCOUNT_JSON env var is not set");
+  if (!env.OAUTH_CLIENT_ID || !env.OAUTH_CLIENT_SECRET) {
+    throw new Error("OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET must be set");
   }
 
   const cached = (await env.TOKEN_CACHE.get(TOKEN_CACHE_KEY, "json").catch(
@@ -23,49 +38,55 @@ export async function getAccessToken(env: Env): Promise<string> {
     return cached.access_token;
   }
 
-  const sa = parseServiceAccount(env.GA_SERVICE_ACCOUNT_JSON);
-  const now = nowSeconds();
-  const tokenUri = sa.token_uri || "https://oauth2.googleapis.com/token";
+  if (!inFlightRefresh) {
+    inFlightRefresh = refreshAccessToken(env).finally(() => {
+      inFlightRefresh = null;
+    });
+  }
+  return inFlightRefresh;
+}
 
-  const header = { alg: "RS256", typ: "JWT" };
-  const claim = {
-    iss: sa.client_email,
-    scope: SCOPE,
-    aud: tokenUri,
-    exp: now + 3600,
-    iat: now,
-  };
-
-  const unsigned = `${b64urlEncode(JSON.stringify(header))}.${b64urlEncode(
-    JSON.stringify(claim),
-  )}`;
-  const signature = await sign(unsigned, sa.private_key);
-  const assertion = `${unsigned}.${signature}`;
+async function refreshAccessToken(env: Env): Promise<string> {
+  const refreshToken = await getRefreshToken(env);
+  if (!refreshToken) {
+    throw new Error("No refresh token stored. Visit /oauth/start to authorise.");
+  }
 
   const body = new URLSearchParams({
-    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-    assertion,
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    client_id: env.OAUTH_CLIENT_ID,
+    client_secret: env.OAUTH_CLIENT_SECRET,
   });
 
-  const res = await fetch(tokenUri, {
+  const res = await fetch(TOKEN_URI, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body,
   });
   if (!res.ok) {
+    const detail = await safeText(res);
+    // A revoked/expired refresh token (e.g. a 7-day "Testing"-mode token) comes
+    // back as invalid_grant — point the operator at re-authorisation.
+    const hint = detail.includes("invalid_grant")
+      ? " — refresh token expired or revoked; visit /oauth/start to re-authorise."
+      : "";
     throw new Error(
-      `Google token exchange failed ${res.status}: ${await safeText(res)}`,
+      `Google token exchange failed ${res.status}: ${detail}${hint}`,
     );
   }
   const data = (await res.json()) as Partial<{
     access_token: string;
     expires_in: number;
   }>;
-  if (typeof data.access_token !== "string" || typeof data.expires_in !== "number") {
+  if (
+    typeof data.access_token !== "string" ||
+    typeof data.expires_in !== "number"
+  ) {
     throw new Error("Token exchange returned an unexpected response shape");
   }
 
-  const expiresAt = now + data.expires_in;
+  const expiresAt = nowSeconds() + data.expires_in;
   const ttl = Math.max(60, data.expires_in - TTL_SAFETY_SECONDS);
   await env.TOKEN_CACHE.put(
     TOKEN_CACHE_KEY,
@@ -76,48 +97,67 @@ export async function getAccessToken(env: Env): Promise<string> {
   return data.access_token;
 }
 
-function parseServiceAccount(raw: string): ServiceAccount {
-  let parsed: ServiceAccount;
-  try {
-    parsed = JSON.parse(raw) as ServiceAccount;
-  } catch {
-    throw new Error("SERVICE_ACCOUNT_JSON is not valid JSON");
+// The refresh token is written to KV by the OAuth callback. OAUTH_REFRESH_TOKEN
+// is an optional secret fallback for bootstrapping without the browser flow.
+async function getRefreshToken(env: Env): Promise<string | null> {
+  const fromKv = await env.TOKEN_CACHE.get(REFRESH_TOKEN_KEY, "text").catch(
+    () => null,
+  );
+  if (fromKv && fromKv.length > 0) return fromKv;
+  if (env.OAUTH_REFRESH_TOKEN && env.OAUTH_REFRESH_TOKEN.length > 0) {
+    return env.OAUTH_REFRESH_TOKEN;
   }
-  if (!parsed.client_email || !parsed.private_key) {
+  return null;
+}
+
+// Exchanges the authorization code from the OAuth callback for tokens, storing
+// the refresh token (and seeding the access-token cache) in KV.
+export async function exchangeAuthCode(
+  env: Env,
+  code: string,
+  redirectUri: string,
+): Promise<{ hasRefreshToken: boolean }> {
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    code,
+    client_id: env.OAUTH_CLIENT_ID,
+    client_secret: env.OAUTH_CLIENT_SECRET,
+    redirect_uri: redirectUri,
+  });
+
+  const res = await fetch(TOKEN_URI, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  if (!res.ok) {
     throw new Error(
-      "SERVICE_ACCOUNT_JSON is missing client_email or private_key",
+      `Authorization code exchange failed ${res.status}: ${await safeText(res)}`,
     );
   }
-  return parsed;
-}
+  const data = (await res.json()) as Partial<{
+    refresh_token: string;
+    access_token: string;
+    expires_in: number;
+  }>;
 
-async function sign(data: string, pem: string): Promise<string> {
-  const keyData = pemToArrayBuffer(pem);
-  const key = await crypto.subtle.importKey(
-    "pkcs8",
-    keyData,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const sig = await crypto.subtle.sign(
-    "RSASSA-PKCS1-v1_5",
-    key,
-    new TextEncoder().encode(data),
-  );
-  return b64urlFromBytes(new Uint8Array(sig));
-}
+  if (typeof data.refresh_token === "string" && data.refresh_token.length > 0) {
+    await env.TOKEN_CACHE.put(REFRESH_TOKEN_KEY, data.refresh_token);
+  }
+  if (
+    typeof data.access_token === "string" &&
+    typeof data.expires_in === "number"
+  ) {
+    const expiresAt = nowSeconds() + data.expires_in;
+    const ttl = Math.max(60, data.expires_in - TTL_SAFETY_SECONDS);
+    await env.TOKEN_CACHE.put(
+      TOKEN_CACHE_KEY,
+      JSON.stringify({ access_token: data.access_token, expires_at: expiresAt }),
+      { expirationTtl: ttl },
+    );
+  }
 
-function pemToArrayBuffer(pem: string): ArrayBuffer {
-  const cleaned = pem
-    .replace(/\\n/g, "\n")
-    .replace(/-----BEGIN [^-]+-----/g, "")
-    .replace(/-----END [^-]+-----/g, "")
-    .replace(/\s+/g, "");
-  const binary = atob(cleaned);
-  const buf = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i);
-  return buf.buffer;
+  return { hasRefreshToken: typeof data.refresh_token === "string" };
 }
 
 async function safeText(res: Response): Promise<string> {
@@ -130,14 +170,4 @@ async function safeText(res: Response): Promise<string> {
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
-}
-
-function b64urlEncode(s: string): string {
-  return b64urlFromBytes(new TextEncoder().encode(s));
-}
-
-function b64urlFromBytes(bytes: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-  return btoa(s).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
 }

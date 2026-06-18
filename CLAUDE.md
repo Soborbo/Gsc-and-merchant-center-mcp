@@ -5,10 +5,10 @@ Google Search Console + Google Merchant Center adatok exponálása MCP szerverk�
 ## Mission
 
 Egy Cloudflare Worker, ami:
-- Service account autentikációval csatlakozik Google API-khoz
+- Google user OAuth-tal (authorization code + refresh token) csatlakozik a Google API-khoz
 - MCP protokollon kommunikál Claude-dal a connector URL-en keresztül
 - 11 tool-t expose-ol: 6 GSC + 5 Merchant Center
-- Single tenant (egy service account, több ügyfél property)
+- Single tenant (egy OAuth-fiók, több ügyfél property)
 
 Nem ad hozzá GA4 tool-t. A `ga4-mcp` worker érintetlenül marad.
 
@@ -45,26 +45,33 @@ Tool handler:
 
 ### Auth flow
 
+A connector egy Google **user** nevében hitelesít (OAuth 2.0 authorization code + refresh token), NEM service accounttal. Így örökli a felhasználó meglévő hozzáférését minden GSC property-hez és Merchant Center fiókhoz — nincs per-property megosztás.
+
+Egyszeri authorizáció (böngészőből):
+
 ```
-getAccessToken(env):
-  1. Check KV cache (TOKEN_CACHE) for key "google:access_token"
-     - if found AND expires_at > now + 60s → return cached
-  2. Parse SERVICE_ACCOUNT_JSON from env
-  3. Build JWT:
-     - iss = service_account.client_email
-     - scope = "https://www.googleapis.com/auth/webmasters https://www.googleapis.com/auth/content"
-     - aud = "https://oauth2.googleapis.com/token"
-     - exp = now + 3600
-     - iat = now
-  4. Sign JWT with service_account.private_key (RS256)
-  5. POST to https://oauth2.googleapis.com/token
-     - grant_type = "urn:ietf:params:oauth:grant-type:jwt-bearer"
-     - assertion = signed_jwt
-  6. Cache token in KV with TTL = expires_in - 120s
-  7. Return access_token
+GET /oauth/start?token={CONNECTOR_TOKEN}
+  → redirect az accounts.google.com consent oldalra
+     (scope: webmasters.readonly + content, access_type=offline, prompt=consent)
+  → Google visszairányít: /oauth/callback?code=...&state={CONNECTOR_TOKEN}
+  → exchangeAuthCode: code → refresh_token, KV-be mentve ("google:refresh_token")
 ```
 
-Reuse pattern from ga4-mcp. Egyetlen különbség: a scope string-be két scope kerül szóközzel elválasztva (webmasters + content), nem csak analytics.readonly.
+Tokenfeloldás minden tool híváskor:
+
+```
+getAccessToken(env):
+  1. KV cache (TOKEN_CACHE) "google:access_token" → ha van ÉS expires_at > now + 300s → cached
+  2. refresh_token feloldása: KV "google:refresh_token", fallback env.OAUTH_REFRESH_TOKEN
+     - ha egyik sincs → hiba: "Visit /oauth/start to authorise."
+  3. POST https://oauth2.googleapis.com/token
+     - grant_type = "refresh_token"
+     - refresh_token + client_id (OAUTH_CLIENT_ID) + client_secret (OAUTH_CLIENT_SECRET)
+  4. access_token KV-be cache-elve, TTL = expires_in - 600s
+  5. Return access_token
+```
+
+⚠️ "Testing" státuszú OAuth consent screen mellett a refresh token 7 nap után lejár. Tartós működéshez az OAuth appot **In production** állapotba kell tenni (lásd Google Cloud setup).
 
 ## Environment & Bindings
 
@@ -84,8 +91,10 @@ id = "<létrehozandó>"
 # nincs publikus var
 
 # secrets (wrangler secret put):
-# SERVICE_ACCOUNT_JSON  — Google service account teljes JSON tartalma
-# CONNECTOR_TOKEN       — 32-64 karakter hex string, az URL path része
+# OAUTH_CLIENT_ID       — Google OAuth 2.0 web client ID
+# OAUTH_CLIENT_SECRET   — Google OAuth 2.0 web client secret
+# CONNECTOR_TOKEN       — 32-64 karakter hex string; URL path + /oauth/start védelme
+# OAUTH_REFRESH_TOKEN   — opcionális fallback; normál esetben a KV-ben (lásd /oauth/start)
 ```
 
 KV namespace létrehozás:
@@ -95,9 +104,15 @@ wrangler kv namespace create TOKEN_CACHE
 
 Secret feltöltés:
 ```bash
-wrangler secret put SERVICE_ACCOUNT_JSON < service-account.json
+wrangler secret put OAUTH_CLIENT_ID
+wrangler secret put OAUTH_CLIENT_SECRET
 wrangler secret put CONNECTOR_TOKEN
 # beírod a generált hex stringet
+```
+
+Authorizáció (egyszeri, böngészőből), miután a secret-ek megvannak:
+```
+https://seo-mcp.golaxo.workers.dev/oauth/start?token={CONNECTOR_TOKEN}
 ```
 
 Connector token generálás (egyszer, manuálisan):
@@ -114,8 +129,8 @@ seo-mcp/
 ├── tsconfig.json
 ├── .gitignore
 └── src/
-    ├── index.ts              # Worker entry point, MCP server init
-    ├── auth.ts               # getAccessToken + JWT signing
+    ├── index.ts              # Worker entry point, MCP init, /oauth routes
+    ├── auth.ts               # getAccessToken + OAuth refresh / code exchange
     ├── tools/
     │   ├── index.ts          # tool registration aggregator
     │   ├── gsc.ts            # 6 GSC tool
@@ -244,7 +259,7 @@ A Merchant Center-hez a **Content API for Shopping v2.1**-et használjuk (`shopp
 
 **Output:** array of `{id, name, websiteUrl, adultContent, sellerId}`.
 
-**API:** `GET https://shoppingcontent.googleapis.com/content/v2.1/accounts/authinfo` — listázza, hogy a service account melyik account-okat éri el.
+**API:** `GET https://shoppingcontent.googleapis.com/content/v2.1/accounts/authinfo` — listázza, hogy az OAuth-fiók melyik account-okat éri el.
 
 Note: ha sub-accountok vannak, ezekhez külön `accounts/{merchantId}/accounts` hívás kellhet.
 
@@ -384,33 +399,27 @@ Search Console API           https://console.cloud.google.com/apis/library/searc
 Content API for Shopping     https://console.cloud.google.com/apis/library/shoppingcontent.googleapis.com
 ```
 
-### Service account
+### OAuth client
 
-Két opció:
+A worker egy Google OAuth 2.0 **web application** klienst használ (nem service accountot).
 
-**A) Reuse ga4-mcp service account**
-Egyszerűbb. Egy service account, mindenhez. Ugyanaz a `SERVICE_ACCOUNT_JSON` mehet a seo-mcp envjébe is.
+1. Google Cloud Console → APIs & Services → Credentials → Create credentials → OAuth client ID
+2. Application type: **Web application**
+3. Authorized redirect URI: `https://seo-mcp.golaxo.workers.dev/oauth/callback`
+   (lokális teszthez: `http://localhost:8787/oauth/callback`)
+4. Client ID → `OAUTH_CLIENT_ID` secret, Client secret → `OAUTH_CLIENT_SECRET` secret
 
-**B) Új service account a seo-mcp-nek**
-Jobb separation of concerns. Új JSON key. Ezt csak akkor érdemes ha a ga4-mcp SA-t valami miatt nem akarod terhelni vagy ha egy ügyfél kifejezetten nem akar GA4 access-t adni a SEO SA-nak.
+### OAuth consent screen
 
-Default ajánlás: **A) reuse**.
+1. APIs & Services → OAuth consent screen (újabb UI: Google Auth Platform → Audience)
+2. User type: **External** (sima Gmail-fiókkal nincs Internal opció)
+3. Scope-ok: `webmasters.readonly` + `content`
+4. **Publishing status: In production.** Kritikus: "Testing" módban a refresh token 7 nap után lejár, és kézzel újra kell authorizálni (`/oauth/start`). Production módban tartós marad.
+   - Sensitive scope-ok miatt megjelenhet "unverified app" figyelmeztetés — saját használatra a consent oldalon átkattintható (Advanced → Go to seo-mcp). Teljes Google-verifikáció a tartós tokenhez nem szükséges.
 
-### Property sharing
+### Property hozzáférés
 
-Minden GSC property és Merchant Center account-ban hozzá kell adni a service account email-jét. Ez egyszeri ügyfélmunka per property.
-
-**GSC:**
-1. Search Console → Settings → Users and permissions
-2. Add user → service account email (`xxx@yyy.iam.gserviceaccount.com`)
-3. Permission: **Owner** vagy **Full** (Restricted nem elég URL inspection-höz)
-
-**Merchant Center:**
-1. Merchant Center → Settings → Users
-2. Add user → service account email
-3. Role: **Admin** (vagy Standard, ha csak olvasás kell)
-
-Dokumentáld melyik ügyfél property-i vannak megosztva (egy egyszerű markdown lista a repo gyökerében: `SHARED_PROPERTIES.md`).
+Nincs per-property megosztás. A connector az authorizáló Google user nevében hív, így automatikusan látja annak minden GSC property-jét és Merchant Center fiókját. Az authorizáló fióknak GSC-ben legalább **Full** jogosultság kell (Restricted nem elég URL inspection-höz), Merchant Centerben legalább olvasási jog az adott account-on.
 
 ## Local development
 
@@ -423,8 +432,10 @@ A `wrangler dev` lokálisan futtatja a workert `http://localhost:8787/mcp/{CONNE
 
 `.dev.vars` fájl a lokális secret-eknek:
 ```
-SERVICE_ACCOUNT_JSON={"type":"service_account",...}
+OAUTH_CLIENT_ID=xxxxx.apps.googleusercontent.com
+OAUTH_CLIENT_SECRET=xxxxx
 CONNECTOR_TOKEN=local-dev-token-abc123
+# opcionális: OAUTH_REFRESH_TOKEN=xxxxx (különben /oauth/start a localhoston)
 ```
 
 A `.dev.vars` **gitignore-ban** kell legyen. Ne committold soha.
@@ -449,7 +460,7 @@ A projekt akkor kész, ha **mind a 11 alábbi teljesül**:
 
 1. `pnpm wrangler deploy` hibamentesen lefut, worker él a `.workers.dev` címen
 2. Claude connector hozzáadás sikeres, mind a 11 tool látszik a Claude tool listájában
-3. `gsc_list_sites` visszaad legalább 1 property-t (azokat amiket a service account-tal megosztottál)
+3. `gsc_list_sites` visszaad legalább 1 property-t (az authorizáló OAuth-fiók GSC property-i)
 4. `gsc_search_analytics` lefut trapezlemezes.hu-ra utolsó 28 napra, query+page dimensionnel, ad vissza rows-t
 5. `gsc_quick_wins` lefut, ad vissza prioritizált listát egy működő property-re
 6. `gsc_url_inspection` lefut egy konkrét URL-re, ad vissza index status-t
@@ -465,8 +476,8 @@ Nem DoD: dokumentáció, README, tesztek. Ezeket utólag, ha napi munkában bev�
 
 - **Ne** rakj a worker kódjába hardcoded property listát vagy ügyfél specifikus konfigot. Multi-client = paraméterben adott `siteUrl` / `merchantId`.
 - **Ne** csinálj caching layer-t a tool response-okra. KV cache csak az access token-re van. A search analytics adat mindig fresh kell legyen.
-- **Ne** próbálj OAuth2 flow-t implementálni. Service account JWT-vel megyünk, mint a ga4-mcp.
-- **Ne** használj `node:crypto`-t a JWT-aláíráshoz. Workers Web Crypto API-val (`crypto.subtle`) menjen, RS256-tal.
+- **Ne** válts vissza service account JWT-re. A connector user OAuth-tal megy (refresh token a KV-ben); a service account per-property megosztást igényelne.
+- **Ne** hagyd védtelenül a `/oauth/start`-ot — a `CONNECTOR_TOKEN` query param védi, mert az indítja a Google consentet, és csak az operátor futtathatja.
 - **Ne** logolj request body-t vagy access token-t a console-ba. Production worker-ben minden log látszik a Cloudflare dashboard-on.
 - **Ne** írj absztrakciós layer-t a Google API hívások köré ("GoogleApiClient class"). Minden tool közvetlenül `fetch()`-el. Egyszerűbb debug, kevesebb kód.
 - **Ne** adj hozzá tool-okat ami nincs a fenti listában. Ha új igény van, írj új CLAUDE.md-t hozzá, vagy update-eld ezt.
@@ -479,7 +490,7 @@ A következőkre **nem** vonatkozik ez a projekt, ezeket NE csináld meg:
 
 - Google Trends connector — alpha API, később
 - Google Ads connector — Pipeboard MCP-vel van lefedve, nem duplikáljuk
-- Multi-tenant OAuth — single-tenant SA elég a use case-re
+- Multi-tenant OAuth (per-user dinamikus tokenek) — single-tenant, egy fix OAuth-fiók elég a use case-re
 - Frontend / dashboard / UI — ez egy MCP backend, Claude a UI
 - Email reportok / cron jobok — ha kell, külön worker
 - Funnel report (GA4-be tartozik, ha kell add hozzá a ga4-mcp-hez)
