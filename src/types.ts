@@ -1,15 +1,11 @@
 export interface Env {
   TOKEN_CACHE: KVNamespace;
-  GA_SERVICE_ACCOUNT_JSON: string;
   CONNECTOR_TOKEN: string;
-}
-
-export interface ServiceAccount {
-  type: string;
-  client_email: string;
-  private_key: string;
-  private_key_id: string;
-  token_uri: string;
+  OAUTH_CLIENT_ID: string;
+  OAUTH_CLIENT_SECRET: string;
+  // Optional bootstrap fallback. Normally the refresh token is stored in KV by
+  // the /oauth/start browser flow, so this secret is not needed.
+  OAUTH_REFRESH_TOKEN?: string;
 }
 
 export interface CachedToken {

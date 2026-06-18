@@ -9,5 +9,7 @@ id = "7f95ecc8dc68425090bc83b9462fda8b"
 
 [vars]
 # secrets set via `wrangler secret put`:
-# SERVICE_ACCOUNT_JSON  — Google service account full JSON
-# CONNECTOR_TOKEN       — 32-64 char hex string, part of the URL path
+# OAUTH_CLIENT_ID       — Google OAuth 2.0 web client ID
+# OAUTH_CLIENT_SECRET   — Google OAuth 2.0 web client secret
+# CONNECTOR_TOKEN       — 32-64 char hex string; URL path segment + gates /oauth/start
+# OAUTH_REFRESH_TOKEN   — optional fallback; normally stored in KV by /oauth/start
