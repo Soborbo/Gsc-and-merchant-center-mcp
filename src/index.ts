@@ -44,9 +44,11 @@ export default {
 // Kicks off the Google OAuth consent flow. Guarded by CONNECTOR_TOKEN so only
 // the operator (who knows the token) can re-authorise the connector.
 function handleOAuthStart(url: URL, env: Env): Response {
+  const provided = url.searchParams.get("token");
   if (
     !env.CONNECTOR_TOKEN ||
-    url.searchParams.get("token") !== env.CONNECTOR_TOKEN
+    !provided ||
+    !constantTimeEqual(provided, env.CONNECTOR_TOKEN)
   ) {
     return new Response("unauthorized: bad or missing token", { status: 401 });
   }
@@ -102,9 +104,21 @@ async function handleOAuthCallback(url: URL, env: Env): Promise<Response> {
 
 function htmlResponse(message: string, status: number): Response {
   return new Response(
-    `<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;max-width:40rem;margin:4rem auto;padding:0 1rem"><p>${message}</p></body>`,
+    `<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;max-width:40rem;margin:4rem auto;padding:0 1rem"><p>${htmlEscape(message)}</p></body>`,
     { status, headers: { "content-type": "text/html; charset=utf-8" } },
   );
+}
+
+// Escape interpolated text (OAuth error / exception messages) before it lands
+// in the HTML response, even though the callback is already gated by the state
+// check.
+function htmlEscape(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 async function handleMcpRequest(request: Request, env: Env): Promise<Response> {

@@ -51,8 +51,14 @@ export async function getAccessToken(env: Env): Promise<string> {
     body,
   });
   if (!res.ok) {
+    const detail = await safeText(res);
+    // A revoked/expired refresh token (e.g. a 7-day "Testing"-mode token) comes
+    // back as invalid_grant — point the operator at re-authorisation.
+    const hint = detail.includes("invalid_grant")
+      ? " — refresh token expired or revoked; visit /oauth/start to re-authorise."
+      : "";
     throw new Error(
-      `Google token exchange failed ${res.status}: ${await safeText(res)}`,
+      `Google token exchange failed ${res.status}: ${detail}${hint}`,
     );
   }
   const data = (await res.json()) as Partial<{
