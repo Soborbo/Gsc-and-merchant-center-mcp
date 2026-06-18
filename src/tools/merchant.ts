@@ -90,6 +90,27 @@ async function mcFetch(env: Env, url: string): Promise<unknown> {
   return parsed;
 }
 
+// Enumerate every sub-account under an MCA aggregator, following pagination.
+// authinfo only returns the aggregator itself, so sub-accounts need this call.
+async function listSubAccounts(
+  env: Env,
+  aggregatorId: string,
+): Promise<unknown[]> {
+  const out: unknown[] = [];
+  let pageToken: string | undefined;
+  do {
+    const params = new URLSearchParams({ maxResults: "250" });
+    if (pageToken) params.set("pageToken", pageToken);
+    const data = (await mcFetch(
+      env,
+      `${BASE}/${encodeURIComponent(aggregatorId)}/accounts?${params}`,
+    )) as { resources?: unknown[]; nextPageToken?: string };
+    if (data.resources) out.push(...data.resources);
+    pageToken = data.nextPageToken;
+  } while (pageToken);
+  return out;
+}
+
 const listProductsInput = {
   merchantId: z.string(),
   maxResults: z.number().int().min(1).max(250).optional().describe("Default 50."),
@@ -141,10 +162,7 @@ export function registerMerchantTools(server: McpServer, env: Env): void {
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     wrap(async () => {
-      const authinfo = (await mcFetch(
-        env,
-        `${BASE}/accounts/authinfo`,
-      )) as {
+      const authinfo = (await mcFetch(env, `${BASE}/accounts/authinfo`)) as {
         accountIdentifiers?: Array<{
           merchantId?: string;
           aggregatorId?: string;
@@ -152,26 +170,55 @@ export function registerMerchantTools(server: McpServer, env: Env): void {
       };
       const ids = authinfo.accountIdentifiers ?? [];
 
-      const results = await Promise.allSettled(
-        ids.map(async (id) => {
-          const owner = id.aggregatorId ?? id.merchantId;
-          const target = id.merchantId ?? id.aggregatorId;
-          if (!owner || !target) {
-            return { identifier: id, error: "missing identifier" };
+      const settled = await Promise.allSettled(
+        ids.map(async (id): Promise<unknown[]> => {
+          // MCA aggregator: return the aggregator account plus every
+          // sub-account under it. Fetch the two independently so a failure on
+          // one doesn't drop the other.
+          if (id.aggregatorId) {
+            const agg = id.aggregatorId;
+            const out: unknown[] = [];
+            try {
+              out.push(
+                await mcFetch(
+                  env,
+                  `${BASE}/${encodeURIComponent(agg)}/accounts/${encodeURIComponent(agg)}`,
+                ),
+              );
+            } catch (e) {
+              out.push({ aggregatorId: agg, error: (e as Error).message });
+            }
+            try {
+              out.push(...(await listSubAccounts(env, agg)));
+            } catch (e) {
+              out.push({
+                aggregatorId: agg,
+                subAccountsError: (e as Error).message,
+              });
+            }
+            return out;
           }
-          const url = `${BASE}/${encodeURIComponent(owner)}/accounts/${encodeURIComponent(target)}`;
-          const account = await mcFetch(env, url);
-          return account;
+          // Standalone account.
+          const mid = id.merchantId;
+          if (!mid) return [{ identifier: id, error: "missing identifier" }];
+          return [
+            await mcFetch(
+              env,
+              `${BASE}/${encodeURIComponent(mid)}/accounts/${encodeURIComponent(mid)}`,
+            ),
+          ];
         }),
       );
 
-      const accounts = results.map((r, i) =>
-        r.status === "fulfilled"
-          ? r.value
-          : { identifier: ids[i], error: (r.reason as Error).message },
-      );
+      const accounts: unknown[] = [];
+      const errors: unknown[] = [];
+      settled.forEach((r, i) => {
+        if (r.status === "fulfilled") accounts.push(...r.value);
+        else
+          errors.push({ identifier: ids[i], error: (r.reason as Error).message });
+      });
 
-      return jsonContent({ identifiers: ids, accounts });
+      return jsonContent({ identifiers: ids, accounts, errors });
     }),
   );
 

@@ -16,6 +16,11 @@ export const OAUTH_SCOPES = [
 
 // Returns a valid Google access token, refreshing via the stored refresh token
 // when the cached access token is missing or about to expire.
+// In-isolate single-flight: concurrent cache-miss callers in the same isolate
+// share one token exchange instead of each hitting Google. Single-tenant, so
+// the env captured by the first caller is equivalent for the rest.
+let inFlightRefresh: Promise<string> | null = null;
+
 export async function getAccessToken(env: Env): Promise<string> {
   if (!env.OAUTH_CLIENT_ID || !env.OAUTH_CLIENT_SECRET) {
     throw new Error("OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET must be set");
@@ -33,6 +38,15 @@ export async function getAccessToken(env: Env): Promise<string> {
     return cached.access_token;
   }
 
+  if (!inFlightRefresh) {
+    inFlightRefresh = refreshAccessToken(env).finally(() => {
+      inFlightRefresh = null;
+    });
+  }
+  return inFlightRefresh;
+}
+
+async function refreshAccessToken(env: Env): Promise<string> {
   const refreshToken = await getRefreshToken(env);
   if (!refreshToken) {
     throw new Error("No refresh token stored. Visit /oauth/start to authorise.");

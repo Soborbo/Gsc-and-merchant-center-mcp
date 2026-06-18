@@ -9,6 +9,8 @@ const SERVER_NAME = "seo-mcp";
 const SERVER_VERSION = "0.1.0";
 const MCP_PREFIX = "/mcp/";
 const OAUTH_CALLBACK_PATH = "/oauth/callback";
+const OAUTH_STATE_PREFIX = "oauth:state:";
+const OAUTH_STATE_TTL_SECONDS = 600;
 
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
@@ -43,7 +45,7 @@ export default {
 
 // Kicks off the Google OAuth consent flow. Guarded by CONNECTOR_TOKEN so only
 // the operator (who knows the token) can re-authorise the connector.
-function handleOAuthStart(url: URL, env: Env): Response {
+async function handleOAuthStart(url: URL, env: Env): Promise<Response> {
   const provided = url.searchParams.get("token");
   if (
     !env.CONNECTOR_TOKEN ||
@@ -55,6 +57,13 @@ function handleOAuthStart(url: URL, env: Env): Response {
   if (!env.OAUTH_CLIENT_ID) {
     return new Response("OAUTH_CLIENT_ID not configured", { status: 500 });
   }
+  // Use a single-use random nonce as the OAuth state (stored in KV) rather than
+  // the connector token, so the all-powerful CONNECTOR_TOKEN never travels
+  // through Google's consent URL or the operator's browser history.
+  const state = crypto.randomUUID();
+  await env.TOKEN_CACHE.put(`${OAUTH_STATE_PREFIX}${state}`, "1", {
+    expirationTtl: OAUTH_STATE_TTL_SECONDS,
+  });
   const redirectUri = `${url.origin}${OAUTH_CALLBACK_PATH}`;
   const consent = new URL("https://accounts.google.com/o/oauth2/v2/auth");
   consent.searchParams.set("client_id", env.OAUTH_CLIENT_ID);
@@ -67,15 +76,26 @@ function handleOAuthStart(url: URL, env: Env): Response {
   consent.searchParams.set("access_type", "offline");
   consent.searchParams.set("prompt", "consent");
   consent.searchParams.set("include_granted_scopes", "true");
-  consent.searchParams.set("state", env.CONNECTOR_TOKEN);
+  consent.searchParams.set("state", state);
   return Response.redirect(consent.toString(), 302);
 }
 
 // Handles the redirect back from Google, exchanging the auth code for tokens.
 async function handleOAuthCallback(url: URL, env: Env): Promise<Response> {
-  if (url.searchParams.get("state") !== env.CONNECTOR_TOKEN) {
-    return htmlResponse("Auth failed: state mismatch.", 400);
+  const state = url.searchParams.get("state");
+  if (!state) {
+    return htmlResponse("Auth failed: missing state.", 400);
   }
+  // Validate and consume the single-use state nonce created by /oauth/start.
+  const stateKey = `${OAUTH_STATE_PREFIX}${state}`;
+  const known = await env.TOKEN_CACHE.get(stateKey).catch(() => null);
+  if (!known) {
+    return htmlResponse(
+      "Auth failed: state mismatch or expired. Restart at /oauth/start.",
+      400,
+    );
+  }
+  await env.TOKEN_CACHE.delete(stateKey).catch(() => {});
   const error = url.searchParams.get("error");
   if (error) {
     return htmlResponse(`Auth failed: ${error}`, 400);
